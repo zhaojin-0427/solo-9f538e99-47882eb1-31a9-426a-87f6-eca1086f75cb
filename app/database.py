@@ -1,11 +1,10 @@
 """SQLite 连接与建表脚本。
 
 设计要点：
-- ``partition_rev`` / ``feature_window`` / ``scoring_slice`` 是不可变的版本化事实记录，
-  同一条同版记录可被多张确认单通过关联表共用，不随后续更正或换版而改变。
-- ``preview`` 即确认单：创建时为 open，确认成功后写入 confirmation_no 变为 confirmed。
-- 三类留存引用（源分区修订、窗口、切片）全部以规范化关联表保存，
-  打开旧单时仅凭留存引用即可复算原清单，不依赖当前最新版本。
+- ``scoring_slice`` 保存不可变的评分切片版本；同一 (风机, 切片名) 版本严格递增。
+- ``slice_alarm`` 保存随该版切片一并落盘的触发告警 UTC 整秒明细。
+  ``has_detail`` 区分"省略列表（缺明细）"与"空列表（确无告警）"两种语义。
+- ``trial_run`` 保存每次核算的入参与结论，重启后选旧版切片仍读该版明细。
 """
 
 from __future__ import annotations
@@ -16,95 +15,51 @@ import sqlite3
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 
--- 风机某 UTC 日期的分区修订，修订号在同一 (风机, 日期) 内严格递增
-CREATE TABLE IF NOT EXISTS partition_rev (
-    id          INTEGER PRIMARY KEY,
-    turbine_id  TEXT    NOT NULL,
-    utc_date    TEXT    NOT NULL,
-    revision    INTEGER NOT NULL,
-    created_at  TEXT    NOT NULL,
-    UNIQUE (turbine_id, utc_date, revision)
-);
-
--- 三日特征窗口的某个版本（窗口覆盖 end_date 及前两天）
-CREATE TABLE IF NOT EXISTS feature_window (
-    id           INTEGER PRIMARY KEY,
-    turbine_id   TEXT    NOT NULL,
-    feature_name TEXT    NOT NULL,
-    end_date     TEXT    NOT NULL,
-    version      INTEGER NOT NULL,
-    created_at   TEXT    NOT NULL,
-    UNIQUE (turbine_id, feature_name, end_date, version)
-);
-
--- 告警评分切片的某个版本
+-- 评分切片版本（不可变）
 CREATE TABLE IF NOT EXISTS scoring_slice (
-    id          INTEGER PRIMARY KEY,
-    turbine_id  TEXT    NOT NULL,
-    slice_name  TEXT    NOT NULL,
-    version     INTEGER NOT NULL,
-    created_at  TEXT    NOT NULL,
+    id            INTEGER PRIMARY KEY,
+    turbine_id    TEXT    NOT NULL,
+    slice_name    TEXT    NOT NULL,
+    version       INTEGER NOT NULL,
+    has_detail    INTEGER NOT NULL,              -- 0=省略列表（缺明细），1=提供了列表（可为空）
+    alarm_count   INTEGER NOT NULL,              -- 入库的去重告警条数
+    created_at    TEXT    NOT NULL,
     UNIQUE (turbine_id, slice_name, version)
 );
 
--- 切片版本引用的窗口版本（不可变的多对多关系）
-CREATE TABLE IF NOT EXISTS slice_window_ref (
-    slice_id  INTEGER NOT NULL REFERENCES scoring_slice(id),
-    window_id INTEGER NOT NULL REFERENCES feature_window(id),
-    PRIMARY KEY (slice_id, window_id)
+-- 切片版本携带的触发告警 UTC 整秒（同秒只存一条）
+CREATE TABLE IF NOT EXISTS slice_alarm (
+    id          INTEGER PRIMARY KEY,
+    slice_id    INTEGER NOT NULL REFERENCES scoring_slice(id),
+    alarm_ts    INTEGER NOT NULL,                -- Unix epoch UTC 整秒
+    UNIQUE (slice_id, alarm_ts)
 );
-CREATE INDEX IF NOT EXISTS idx_swref_window ON slice_window_ref(window_id);
-CREATE INDEX IF NOT EXISTS idx_swref_slice  ON slice_window_ref(slice_id);
+CREATE INDEX IF NOT EXISTS idx_slice_alarm_ts ON slice_alarm(slice_id, alarm_ts);
 
--- 预览 / 确认单主表
-CREATE TABLE IF NOT EXISTS preview (
+-- 核算试算记录
+CREATE TABLE IF NOT EXISTS trial_run (
     id                INTEGER PRIMARY KEY,
-    status            TEXT    NOT NULL DEFAULT 'open',  -- open | confirmed
-    corrections_json  TEXT    NOT NULL,                 -- 发起更正的 (风机, UTC 日期) 清单
-    snapshot_json     TEXT    NOT NULL,                 -- 所见版本快照（确认时比对用）
-    confirmation_no   TEXT    UNIQUE,
-    created_at        TEXT    NOT NULL,
-    confirmed_at      TEXT
+    slice_id          INTEGER NOT NULL REFERENCES scoring_slice(id),
+    turbine_id        TEXT    NOT NULL,
+    start_date        TEXT    NOT NULL,          -- 起始 UTC 日期 YYYY-MM-DD
+    window_start_ts   INTEGER NOT NULL,          -- 起始日零点 epoch
+    notify_cap        INTEGER NOT NULL,
+    work_orders_json  TEXT    NOT NULL,          -- 工单号 + 预警起止整秒
+    status            TEXT    NOT NULL,          -- solved | unsolved
+    interval_s        INTEGER,
+    reason            TEXT,
+    notifications_json TEXT,                     -- 通知时刻整秒列表
+    uncovered_json    TEXT,
+    probes            INTEGER,
+    scanned           INTEGER,
+    created_at        TEXT    NOT NULL
 );
-
--- 确认单留存的源分区修订引用（同版分区可被多张单共用）
-CREATE TABLE IF NOT EXISTS order_partition_ref (
-    preview_id   INTEGER NOT NULL REFERENCES preview(id),
-    partition_id INTEGER NOT NULL REFERENCES partition_rev(id),
-    PRIMARY KEY (preview_id, partition_id)
-);
-
--- 确认单留存的窗口引用
-CREATE TABLE IF NOT EXISTS order_window_ref (
-    preview_id INTEGER NOT NULL REFERENCES preview(id),
-    window_id  INTEGER NOT NULL REFERENCES feature_window(id),
-    PRIMARY KEY (preview_id, window_id)
-);
-
--- 每个留存窗口对应的三日源分区修订（按窗口维度留存，复算时逐窗还原）
-CREATE TABLE IF NOT EXISTS order_window_partition (
-    preview_id   INTEGER NOT NULL REFERENCES preview(id),
-    window_id    INTEGER NOT NULL REFERENCES feature_window(id),
-    partition_id INTEGER NOT NULL REFERENCES partition_rev(id),
-    PRIMARY KEY (preview_id, window_id, partition_id)
-);
-
--- 确认单留存的切片引用
-CREATE TABLE IF NOT EXISTS order_slice_ref (
-    preview_id INTEGER NOT NULL REFERENCES preview(id),
-    slice_id   INTEGER NOT NULL REFERENCES scoring_slice(id),
-    PRIMARY KEY (preview_id, slice_id)
-);
-
--- 确认号发号器（仅确认成功时消耗一个序号）
-CREATE TABLE IF NOT EXISTS order_seq (
-    seq INTEGER PRIMARY KEY AUTOINCREMENT
-);
+CREATE INDEX IF NOT EXISTS idx_trial_slice ON trial_run(slice_id);
 """
 
 
 def db_path() -> str:
-    return os.environ.get("APP_DB_PATH", "/data/vibration.db")
+    return os.environ.get("APP_DB_PATH", "/data/alarm.db")
 
 
 def get_conn() -> sqlite3.Connection:

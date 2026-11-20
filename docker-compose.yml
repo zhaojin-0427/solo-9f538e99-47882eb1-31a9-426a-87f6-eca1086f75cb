@@ -1,15 +1,15 @@
 services:
-  vibration-api:
+  alarm-silence-api:
     build: .
-    image: vibration-recompute-api:latest
-    container_name: vibration-recompute-api
+    image: alarm-silence-api:latest
+    container_name: alarm-silence-api
     ports:
       - "8000:8000"
     environment:
-      APP_DB_PATH: /data/vibration.db
+      APP_DB_PATH: /data/alarm.db
     volumes:
-      - vibration-data:/data
+      - alarm-data:/data
     restart: unless-stopped
 
 volumes:
-  vibration-data:
+  alarm-data:

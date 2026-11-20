@@ -24,3 +24,11 @@ class NotFoundError(ApiError):
 class BadRequestError(ApiError):
     def __init__(self, message: str):
         super().__init__(400, "bad_request", message)
+
+
+class UnprocessableError(ApiError):
+    """请求语义可解析但业务上无法继续（如缺明细时停止核算）。"""
+
+    def __init__(self, code: str, message: str, extra: dict | None = None):
+        super().__init__(422, code, message)
+        self.extra = extra or {}

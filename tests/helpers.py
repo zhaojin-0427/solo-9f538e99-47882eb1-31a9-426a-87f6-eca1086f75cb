@@ -1,77 +1,49 @@
-"""测试辅助：快速构造基础数据集。"""
+"""测试辅助：快速构造切片与工单数据。"""
 
 from __future__ import annotations
 
-
-def put_partition(client, turbine: str, day: str, revision: int) -> dict:
-    r = client.post(
-        "/api/partitions",
-        json={"turbine_id": turbine, "utc_date": day, "revision": revision},
-    )
-    assert r.status_code == 201, r.text
-    return r.json()
+from datetime import datetime, timezone
 
 
-def put_window(
-    client, turbine: str, feature: str, end: str, version: int | None = None
-) -> dict:
-    body = {
-        "turbine_id": turbine,
-        "feature_name": feature,
-        "end_date": end,
-    }
-    if version is not None:
-        body["version"] = version
-    r = client.post("/api/windows", json=body)
-    assert r.status_code == 201, r.text
-    return r.json()
+def epoch(y: int, mo: int, d: int, h: int = 0, mi: int = 0, s: int = 0) -> int:
+    """UTC 日历时间转整秒。"""
+    return int(datetime(y, mo, d, h, mi, s, tzinfo=timezone.utc).timestamp())
 
 
-def put_slice(
+def make_slice(
     client,
-    turbine: str,
-    name: str,
-    refs: list[dict],
+    turbine: str = "WT-01",
+    name: str = "weekly",
+    alarms: list[int] | None = None,
     version: int | None = None,
+    include_field: bool = True,
 ) -> dict:
-    body = {"turbine_id": turbine, "slice_name": name, "window_refs": refs}
+    """登记切片。alarms=None 且 include_field=False 时省略明细字段（缺明细）。"""
+    body: dict = {"turbine_id": turbine, "slice_name": name}
     if version is not None:
         body["version"] = version
+    if include_field:
+        body["alarm_timestamps"] = [] if alarms is None else alarms
     r = client.post("/api/slices", json=body)
     assert r.status_code == 201, r.text
     return r.json()
 
 
-def make_preview(client, corrections: list[dict]) -> tuple[int, dict]:
-    r = client.post("/api/previews", json={"corrections": corrections})
+def make_trial(
+    client,
+    slice_id: int,
+    start_date: str,
+    cap: int,
+    work_orders: list[dict],
+) -> dict:
+    r = client.post(
+        "/api/trials",
+        json={
+            "slice_id": slice_id,
+            "start_date": start_date,
+            "notify_cap": cap,
+            "work_orders": work_orders,
+        },
+    )
     assert r.status_code == 201, r.text
-    data = r.json()
-    return data["preview_id"], data["impact"]
-
-
-def seed_base(client) -> dict:
-    """构造 5 天分区、两个特征各 3 个连续结束日窗口、一个引用全部窗口的切片。"""
-    days = [f"2026-11-{d:02d}" for d in range(11, 16)]
-    for day in days:
-        put_partition(client, "WT-01", day, 1)
-
-    ends = ["2026-11-13", "2026-11-14", "2026-11-15"]
-    rms_windows = [put_window(client, "WT-01", "vib_rms", e) for e in ends]
-    crest_windows = [put_window(client, "WT-01", "vib_crest", e) for e in ends]
-
-    refs = [
-        {
-            "turbine_id": "WT-01",
-            "feature_name": w["feature_name"],
-            "end_date": w["end_date"],
-            "version": w["version"],
-        }
-        for w in rms_windows + crest_windows
-    ]
-    slice_row = put_slice(client, "WT-01", "daily_alert", refs)
-    return {
-        "days": days,
-        "rms": rms_windows,
-        "crest": crest_windows,
-        "slice": slice_row,
-    }
+    return r.json()

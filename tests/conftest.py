@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 @pytest.fixture()
 def client(monkeypatch):
-    tmp_dir = tempfile.mkdtemp(prefix="vib-test-")
+    tmp_dir = tempfile.mkdtemp(prefix="alarm-test-")
     db_path = os.path.join(tmp_dir, "test.db")
     monkeypatch.setenv("APP_DB_PATH", db_path)
 

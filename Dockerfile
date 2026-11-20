@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    APP_DB_PATH=/data/vibration.db
+    APP_DB_PATH=/data/alarm.db
 
 WORKDIR /app
 
